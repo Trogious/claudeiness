@@ -1,0 +1,16 @@
+# Compiled binary
+claudeiness
+
+# Object files
+*.o
+*.d
+
+# Runtime output
+status.json
+
+# macOS
+.DS_Store
+
+# Editor
+*.swp
+*~
