@@ -61,8 +61,24 @@ typedef struct {
 /* ── Step 1: BSD process table scan ──────────────────────────────── */
 
 /*
+ * Check if a string looks like a semver version (e.g. "2.1.89").
+ * Claude Code installed via `claude --install` uses the version number
+ * as the binary filename, so p_comm becomes "2.1.89" instead of "claude".
+ */
+static int is_version_string(const char *s) {
+    if (!s || !(*s >= '0' && *s <= '9')) return 0;
+    int dots = 0;
+    for (const char *p = s; *p; p++) {
+        if (*p == '.') dots++;
+        else if (*p < '0' || *p > '9') return 0;
+    }
+    return dots >= 1;
+}
+
+/*
  * Query the kernel for all processes owned by the current user,
- * return those whose p_comm is exactly "claude".
+ * return those whose p_comm is "claude" or a version string
+ * (for ~/.local/share/claude/versions/<ver> installs).
  */
 static int find_claude_processes(claude_session_t *out, int max) {
     uid_t uid = getuid();
@@ -93,8 +109,12 @@ static int find_claude_processes(claude_session_t *out, int max) {
     for (int i = 0; i < count && found < max; i++) {
         struct kinfo_proc *p = &procs[i];
 
-        /* p_comm is exactly "claude"? (MAXCOMM = 17, null-terminated) */
-        if (strcmp(p->kp_proc.p_comm, "claude") != 0)
+        /*
+         * p_comm is "claude" or a version string like "2.1.89"?
+         * Version strings are validated later via proc_pidpath.
+         */
+        if (strcmp(p->kp_proc.p_comm, "claude") != 0 &&
+            !is_version_string(p->kp_proc.p_comm))
             continue;
 
         /* Skip zombies */
@@ -225,6 +245,15 @@ static int validate_claude_binary(pid_t pid) {
             strcmp(resolved, "/usr/local/bin/claude") == 0) {
             return 1;
         }
+    }
+
+    /*
+     * Claude Code installed via `claude --install` puts the binary at
+     * ~/.local/share/claude/versions/<version> and proc_pidpath resolves
+     * to that versioned path (basename is e.g. "2.1.89", not "claude").
+     */
+    if (strstr(path, "/.local/share/claude/versions/") != NULL) {
+        return is_macho_binary(path);
     }
 
     /*
