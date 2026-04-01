@@ -39,6 +39,7 @@
 #include <mach-o/fat.h>
 #include <arpa/inet.h>
 #include <errno.h>
+#include <sys/wait.h>
 
 /* ── Data structures ─────────────────────────────────────────────── */
 
@@ -554,6 +555,117 @@ static void handle_signal(int sig) {
     g_running = 0;
 }
 
+static int install_service(void) {
+    /* Resolve own binary path */
+    char binary_path[PROC_PIDPATHINFO_MAXSIZE];
+    if (proc_pidpath(getpid(), binary_path, sizeof(binary_path)) <= 0) {
+        fprintf(stderr, "Error: cannot determine binary path: %s\n", strerror(errno));
+        return 1;
+    }
+
+    /* Build plist destination path */
+    const char *home = getenv("HOME");
+    if (!home || home[0] == '\0') {
+        fprintf(stderr, "Error: HOME environment variable not set\n");
+        return 1;
+    }
+    char plist_path[MAX_PATH];
+    int plist_path_len = snprintf(plist_path, sizeof(plist_path),
+             "%s/Library/LaunchAgents/com.claudeiness.agent.plist", home);
+    if (plist_path_len < 0 || (size_t)plist_path_len >= sizeof(plist_path)) {
+        fprintf(stderr, "Error: HOME path too long\n");
+        return 1;
+    }
+
+    /* Read SLACK_TOKEN for embedding; use placeholder if absent */
+    const char *token = getenv("SLACK_TOKEN");
+    const char *token_value = (token && token[0] != '\0')
+                              ? token
+                              : "YOUR_SLACK_TOKEN_HERE";
+
+    /* Generate plist XML */
+    char plist_content[4096];
+    int written = snprintf(plist_content, sizeof(plist_content),
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+        "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\""
+        " \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+        "<plist version=\"1.0\">\n"
+        "<dict>\n"
+        "    <key>Label</key>\n"
+        "    <string>com.claudeiness.agent</string>\n"
+        "    <key>ProgramArguments</key>\n"
+        "    <array>\n"
+        "        <string>%s</string>\n"
+        "        <string>--watch</string>\n"
+        "    </array>\n"
+        "    <key>EnvironmentVariables</key>\n"
+        "    <dict>\n"
+        "        <key>SLACK_TOKEN</key>\n"
+        "        <string>%s</string>\n"
+        "    </dict>\n"
+        "    <key>RunAtLoad</key>\n"
+        "    <true/>\n"
+        "    <key>KeepAlive</key>\n"
+        "    <true/>\n"
+        "    <key>StandardOutPath</key>\n"
+        "    <string>/tmp/claudeiness.log</string>\n"
+        "    <key>StandardErrorPath</key>\n"
+        "    <string>/tmp/claudeiness.error.log</string>\n"
+        "</dict>\n"
+        "</plist>\n",
+        binary_path, token_value);
+
+    if (written < 0 || (size_t)written >= sizeof(plist_content)) {
+        fprintf(stderr, "Error: plist content too large\n");
+        return 1;
+    }
+
+    /* Write plist file */
+    FILE *f = fopen(plist_path, "w");
+    if (!f) {
+        fprintf(stderr, "Error: cannot write plist to %s: %s\n",
+                plist_path, strerror(errno));
+        return 1;
+    }
+    fputs(plist_content, f);
+    fclose(f);
+
+    /* Load the service via launchctl (fork/exec to avoid shell injection) */
+    pid_t pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "Warning: fork failed: %s\n"
+                        "The plist was written to %s — load it manually if needed.\n",
+                strerror(errno), plist_path);
+        return 1;
+    }
+    if (pid == 0) {
+        /* child */
+        execl("/bin/launchctl", "launchctl", "load", plist_path, (char *)NULL);
+        _exit(127);
+    }
+    /* parent: wait for launchctl */
+    int wstatus = 0;
+    waitpid(pid, &wstatus, 0);
+    int exit_code = WIFEXITED(wstatus) ? WEXITSTATUS(wstatus) : -1;
+    if (exit_code != 0) {
+        fprintf(stderr, "Warning: launchctl load exited with status %d\n"
+                        "The plist was written to %s — load it manually if needed.\n",
+                exit_code, plist_path);
+        return 1;
+    }
+
+    printf("Service installed and loaded.\n");
+    printf("  Plist:   %s\n", plist_path);
+    printf("  Binary:  %s\n", binary_path);
+    if (!token || token[0] == '\0') {
+        printf("\nIMPORTANT: SLACK_TOKEN was not set.\n"
+               "Edit the plist and replace YOUR_SLACK_TOKEN_HERE with your token,\n"
+               "then run: launchctl unload \"%s\" && launchctl load \"%s\"\n",
+               plist_path, plist_path);
+    }
+    return 0;
+}
+
 int main(int argc, char *argv[]) {
     int json_output = 0;
     int watch_mode = 0;
@@ -570,21 +682,27 @@ int main(int argc, char *argv[]) {
             if (poll_interval < 1) poll_interval = 1;
         } else if (strcmp(argv[i], "--quiet") == 0 || strcmp(argv[i], "-q") == 0) {
             quiet = 1;
+        } else if (strcmp(argv[i], "--install-service") == 0) {
+            return install_service();
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             fprintf(stderr,
-                "Usage: claudeiness [--json] [--watch [-interval N]]\n\n"
+                "Usage: claudeiness [--json] [--watch [--interval N]]\n"
+                "       claudeiness --install-service\n\n"
                 "Detects running Claude Code sessions and updates Slack status.\n\n"
                 "Modes:\n"
-                "  (default)     One-shot: detect, print, update Slack, exit.\n"
-                "  --watch, -w   Watch: poll every N seconds (default %d),\n"
-                "                update Slack only when session count changes.\n\n"
+                "  (default)          One-shot: detect, print, update Slack, exit.\n"
+                "  --watch, -w        Watch: poll every N seconds (default %d),\n"
+                "                     update Slack only when session count changes.\n"
+                "  --install-service  Generate and install a launchd plist so watch\n"
+                "                     mode starts automatically at login.\n\n"
                 "Options:\n"
                 "  --json          Output as JSON\n"
                 "  --quiet, -q     Suppress all output\n"
                 "  --interval N    Poll interval in seconds (default %d, min 1)\n\n"
                 "Environment:\n"
                 "  SLACK_TOKEN   Slack OAuth token (scope: users.profile:write)\n"
-                "                If not set, Slack update is skipped.\n",
+                "                If not set, Slack update is skipped.\n"
+                "                Set before running --install-service to embed in plist.\n",
                 DEFAULT_POLL_SECONDS, DEFAULT_POLL_SECONDS);
             return 0;
         }
