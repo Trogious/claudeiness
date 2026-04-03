@@ -41,6 +41,8 @@
 #include <errno.h>
 #include <sys/wait.h>
 
+#define EXIT_COMMAND_NOT_FOUND 127
+
 /* ── Data structures ─────────────────────────────────────────────── */
 
 #define MAX_SESSIONS 64
@@ -560,21 +562,21 @@ static int install_service(void) {
     char binary_path[PROC_PIDPATHINFO_MAXSIZE];
     if (proc_pidpath(getpid(), binary_path, sizeof(binary_path)) <= 0) {
         fprintf(stderr, "Error: cannot determine binary path: %s\n", strerror(errno));
-        return 1;
+        return EXIT_FAILURE;
     }
 
     /* Build plist destination path */
     const char *home = getenv("HOME");
     if (!home || home[0] == '\0') {
         fprintf(stderr, "Error: HOME environment variable not set\n");
-        return 1;
+        return EXIT_FAILURE;
     }
     char plist_path[MAX_PATH];
     int plist_path_len = snprintf(plist_path, sizeof(plist_path),
              "%s/Library/LaunchAgents/com.claudeiness.agent.plist", home);
     if (plist_path_len < 0 || (size_t)plist_path_len >= sizeof(plist_path)) {
         fprintf(stderr, "Error: HOME path too long\n");
-        return 1;
+        return EXIT_FAILURE;
     }
 
     /* Read SLACK_TOKEN for embedding; use placeholder if absent */
@@ -617,7 +619,7 @@ static int install_service(void) {
 
     if (written < 0 || (size_t)written >= sizeof(plist_content)) {
         fprintf(stderr, "Error: plist content too large\n");
-        return 1;
+        return EXIT_FAILURE;
     }
 
     /* Write plist file */
@@ -625,7 +627,7 @@ static int install_service(void) {
     if (!f) {
         fprintf(stderr, "Error: cannot write plist to %s: %s\n",
                 plist_path, strerror(errno));
-        return 1;
+        return EXIT_FAILURE;
     }
     fputs(plist_content, f);
     fclose(f);
@@ -636,12 +638,12 @@ static int install_service(void) {
         fprintf(stderr, "Warning: fork failed: %s\n"
                         "The plist was written to %s — load it manually if needed.\n",
                 strerror(errno), plist_path);
-        return 1;
+        return EXIT_FAILURE;
     }
     if (pid == 0) {
         /* child */
         execl("/bin/launchctl", "launchctl", "load", plist_path, (char *)NULL);
-        _exit(127);
+        _exit(EXIT_COMMAND_NOT_FOUND);
     }
     /* parent: wait for launchctl */
     int wstatus = 0;
@@ -651,7 +653,7 @@ static int install_service(void) {
         fprintf(stderr, "Warning: launchctl load exited with status %d\n"
                         "The plist was written to %s — load it manually if needed.\n",
                 exit_code, plist_path);
-        return 1;
+        return EXIT_FAILURE;
     }
 
     printf("Service installed and loaded.\n");
@@ -663,7 +665,7 @@ static int install_service(void) {
                "then run: launchctl unload \"%s\" && launchctl load \"%s\"\n",
                plist_path, plist_path);
     }
-    return 0;
+    return EXIT_SUCCESS;
 }
 
 int main(int argc, char *argv[]) {
@@ -704,7 +706,7 @@ int main(int argc, char *argv[]) {
                 "                If not set, Slack update is skipped.\n"
                 "                Set before running --install-service to embed in plist.\n",
                 DEFAULT_POLL_SECONDS, DEFAULT_POLL_SECONDS);
-            return 0;
+            return EXIT_SUCCESS;
         }
     }
 
@@ -726,7 +728,7 @@ int main(int argc, char *argv[]) {
         if (!has_token) {
             if (!quiet && !json_output)
                 printf("\nSkipping Slack update (set SLACK_TOKEN to enable)\n");
-            return 0;
+            return EXIT_SUCCESS;
         }
 
         int result = update_slack_status(token, count);
@@ -738,16 +740,16 @@ int main(int argc, char *argv[]) {
                        count > 0 ? status_text : "(cleared)");
             }
         } else {
-            return 1;
+            return EXIT_FAILURE;
         }
-        return 0;
+        return EXIT_SUCCESS;
     }
 
     /* ── Watch mode ─────────────────────────────────────────── */
 
     if (!has_token) {
         fprintf(stderr, "Error: --watch requires SLACK_TOKEN to be set\n");
-        return 1;
+        return EXIT_FAILURE;
     }
 
     signal(SIGINT, handle_signal);
@@ -806,5 +808,5 @@ int main(int argc, char *argv[]) {
     }
     update_slack_status(token, 0);
 
-    return 0;
+    return EXIT_SUCCESS;
 }
