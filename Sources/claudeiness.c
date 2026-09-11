@@ -1,11 +1,11 @@
 /*
- * claudeiness — Detect running Claude Code sessions and update Slack status.
+ * claudeiness — Detect selected processes and update Slack status.
  *
  * Detection strategy (layered, cross-referenced):
  *
  * 1. BSD process table scan via sysctl(KERN_PROC_UID)
  *    - Ground truth for what is actually running
- *    - Filters to processes named exactly "claude"
+ *    - Matches selected executable names (defaults to Claude Code)
  *    - Skips zombies
  *
  * 2. Executable path validation via proc_pidpath()
@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 #include <sys/sysctl.h>
 #include <sys/proc_info.h>
@@ -48,9 +49,18 @@
 #define MAX_SESSIONS 64
 #define MAX_PATH 1024
 #define MAX_ARGS 4096
+#define MAX_PROCESSES 16
+#define MAX_PROCESS_NAME 255
+#define MAX_STATUS_TEXT 101
+
+typedef struct {
+    const char *names[MAX_PROCESSES];
+    int count;
+} process_config_t;
 
 typedef struct {
     pid_t pid;
+    int   process_index;
     char  tty[32];
     char  args[MAX_ARGS];
     char  cwd[MAX_PATH];
@@ -59,7 +69,34 @@ typedef struct {
     char  session_id[128];
     int   has_session_file;
     time_t started_at;    /* 0 = unknown */
-} claude_session_t;
+} process_session_t;
+
+static int is_claude(const char *name) {
+    return strcasecmp(name, "claude") == 0;
+}
+
+static int add_process(process_config_t *config, const char *name) {
+    if (!name[0] || name[0] == '-' || strlen(name) > MAX_PROCESS_NAME ||
+        strchr(name, '/')) {
+        fprintf(stderr, "Error: --process requires an executable name (1–255 bytes), not a path\n");
+        return 0;
+    }
+    for (const unsigned char *p = (const unsigned char *)name; *p; p++) {
+        if (*p < 0x20 || *p == 0x7f) {
+            fprintf(stderr, "Error: process names cannot contain control characters\n");
+            return 0;
+        }
+    }
+    for (int i = 0; i < config->count; i++) {
+        if (strcasecmp(config->names[i], name) == 0) return 1;
+    }
+    if (config->count == MAX_PROCESSES) {
+        fprintf(stderr, "Error: at most %d process names can be monitored\n", MAX_PROCESSES);
+        return 0;
+    }
+    config->names[config->count++] = is_claude(name) ? "claude" : name;
+    return 1;
+}
 
 /* ── Step 1: BSD process table scan ──────────────────────────────── */
 
@@ -78,12 +115,30 @@ static int is_version_string(const char *s) {
     return dots >= 1;
 }
 
-/*
- * Query the kernel for all processes owned by the current user,
- * return those whose p_comm is "claude" or a version string
- * (for ~/.local/share/claude/versions/<ver> installs).
- */
-static int find_claude_processes(claude_session_t *out, int max) {
+static int validate_claude_binary(pid_t pid);
+
+/* Prefer the full executable basename: macOS truncates p_comm. */
+static int match_process(const process_config_t *config, const char *comm,
+                         const char *path) {
+    const char *basename = strrchr(path, '/');
+    basename = basename ? basename + 1 : path;
+    for (int i = 0; i < config->count; i++) {
+        if (!is_claude(config->names[i]) &&
+            strcasecmp(config->names[i], path[0] ? basename : comm) == 0) {
+            return i;
+        }
+    }
+    for (int i = 0; i < config->count; i++) {
+        if (is_claude(config->names[i]) &&
+            (strcmp(comm, "claude") == 0 || is_version_string(comm)))
+            return i;  /* Claude-specific binary validation follows. */
+    }
+    return -1;
+}
+
+/* Query the current user's live processes and collect selected executables. */
+static int find_processes(process_session_t *out, int max,
+                          const process_config_t *config) {
     uid_t uid = getuid();
     int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_UID, (int)uid };
     size_t buf_size = 0;
@@ -112,21 +167,29 @@ static int find_claude_processes(claude_session_t *out, int max) {
     for (int i = 0; i < count && found < max; i++) {
         struct kinfo_proc *p = &procs[i];
 
-        /*
-         * p_comm is "claude" or a version string like "2.1.89"?
-         * Version strings are validated later via proc_pidpath.
-         */
-        if (strcmp(p->kp_proc.p_comm, "claude") != 0 &&
-            !is_version_string(p->kp_proc.p_comm))
-            continue;
-
         /* Skip zombies */
         if (p->kp_proc.p_stat == SZOMB)
             continue;
 
-        claude_session_t *s = &out[found];
+        if (config->count == 1 && is_claude(config->names[0]) &&
+            strcmp(p->kp_proc.p_comm, "claude") != 0 &&
+            !is_version_string(p->kp_proc.p_comm))
+            continue;
+
+        char path[PROC_PIDPATHINFO_MAXSIZE] = "";
+        if (proc_pidpath(p->kp_proc.p_pid, path, sizeof(path)) <= 0)
+            path[0] = '\0';
+        int process_index = match_process(config, p->kp_proc.p_comm, path);
+        if (process_index < 0 ||
+            (is_claude(config->names[process_index]) &&
+             !validate_claude_binary(p->kp_proc.p_pid)))
+            continue;
+
+        process_session_t *s = &out[found];
         memset(s, 0, sizeof(*s));
         s->pid = p->kp_proc.p_pid;
+        s->process_index = process_index;
+        snprintf(s->exe_path, sizeof(s->exe_path), "%s", path);
 
         /* TTY device → name */
         dev_t tdev = p->kp_eproc.e_tdev;
@@ -141,7 +204,8 @@ static int find_claude_processes(claude_session_t *out, int max) {
             size_t args_size = 0;
             if (sysctl(args_mib, 3, NULL, &args_size, NULL, 0) == 0 && args_size > 0) {
                 char *buf = malloc(args_size);
-                if (buf && sysctl(args_mib, 3, buf, &args_size, NULL, 0) == 0) {
+                if (buf && sysctl(args_mib, 3, buf, &args_size, NULL, 0) == 0 &&
+                    args_size >= sizeof(int)) {
                     /* Layout: [int argc][exec_path\0][padding\0s][argv0\0 argv1\0 ...] */
                     int argc;
                     memcpy(&argc, buf, sizeof(int));
@@ -156,7 +220,7 @@ static int find_claude_processes(claude_session_t *out, int max) {
                     size_t out_off = 0;
                     int arg_i = 0;
                     while (off < args_size && arg_i < argc) {
-                        size_t len = strlen(&buf[off]);
+                        size_t len = strnlen(&buf[off], args_size - off);
                         if (len > 0) {
                             if (out_off > 0 && out_off < MAX_ARGS - 1)
                                 s->args[out_off++] = ' ';
@@ -174,7 +238,7 @@ static int find_claude_processes(claude_session_t *out, int max) {
                 free(buf);
             }
             if (s->args[0] == '\0')
-                snprintf(s->args, sizeof(s->args), "claude");
+                snprintf(s->args, sizeof(s->args), "%s", config->names[process_index]);
         }
 
         /* Current working directory via proc_pidinfo */
@@ -321,7 +385,8 @@ static int json_get_number(const char *json, const char *key, long long *out) {
 /*
  * Scan ~/.claude/sessions/ *.json and enrich matching sessions.
  */
-static void enrich_from_session_files(claude_session_t *sessions, int count) {
+static void enrich_from_session_files(process_session_t *sessions, int count,
+                                       const process_config_t *config) {
     struct passwd *pw = getpwuid(getuid());
     if (!pw) return;
 
@@ -354,7 +419,8 @@ static void enrich_from_session_files(claude_session_t *sessions, int count) {
 
         /* Find matching live session */
         for (int i = 0; i < count; i++) {
-            if (sessions[i].pid == (pid_t)file_pid) {
+            if (is_claude(config->names[sessions[i].process_index]) &&
+                sessions[i].pid == (pid_t)file_pid) {
                 sessions[i].has_session_file = 1;
                 json_get_string(buf, "sessionId", sessions[i].session_id,
                                 sizeof(sessions[i].session_id));
@@ -378,20 +444,54 @@ static void enrich_from_session_files(claude_session_t *sessions, int count) {
 
 #define MAX_STATUS_EMOJIS 7
 
-/*
- * Build the status_text: 0–7 repetitions of ":claude_code:" separated by spaces.
- * 0 sessions → empty string (clears status).
- */
-static void build_status_text(int session_count, char *out, size_t out_size) {
-    int n = session_count > MAX_STATUS_EMOJIS ? MAX_STATUS_EMOJIS : session_count;
-    size_t off = 0;
-    for (int i = 0; i < n; i++) {
-        int wrote = snprintf(out + off, out_size - off,
-                             "%s:claude_code:", i > 0 ? " " : "");
-        if (wrote < 0 || (size_t)wrote >= out_size - off) break;
-        off += (size_t)wrote;
+/* Append a label without splitting a UTF-8 character at the status limit. */
+static void append_status_label(char *out, size_t out_size, const char *label) {
+    size_t off = strlen(out);
+    size_t separator = off > 0 ? 1 : 0;
+    if (off + separator + 1 >= out_size) return;
+    size_t len = strlen(label);
+    size_t available = out_size - off - separator - 1;
+    size_t copy = len < available ? len : available;
+    while (copy > 0 && ((unsigned char)label[copy] & 0xc0) == 0x80) copy--;
+    if (copy == 0) return;
+    if (separator) out[off++] = ' ';
+    memcpy(out + off, label, copy);
+    out[off + copy] = '\0';
+}
+
+/* Keep Claude's emoji count; identify other apps by name and process count. */
+static void build_status_text(const process_config_t *config, const int *counts,
+                              char *out, size_t out_size) {
+    if (out_size == 0) return;
+    out[0] = '\0';
+    for (int i = 0; i < config->count; i++) {
+        if (counts[i] <= 0) continue;
+        if (is_claude(config->names[i])) {
+            int n = counts[i] > MAX_STATUS_EMOJIS ? MAX_STATUS_EMOJIS : counts[i];
+            for (int j = 0; j < n; j++)
+                append_status_label(out, out_size, ":claude_code:");
+        } else {
+            char label[MAX_PROCESS_NAME + 32];
+            if (counts[i] == 1)
+                snprintf(label, sizeof(label), "%s", config->names[i]);
+            else
+                snprintf(label, sizeof(label), "%s (%d)", config->names[i], counts[i]);
+            append_status_label(out, out_size, label);
+        }
     }
-    if (n == 0) out[0] = '\0';
+}
+
+static void write_json_string(FILE *out, const char *value) {
+    fputc('"', out);
+    for (const unsigned char *p = (const unsigned char *)value; *p; p++) {
+        if (*p == '"' || *p == '\\')
+            fprintf(out, "\\%c", *p);
+        else if (*p < 0x20)
+            fprintf(out, "\\u%04x", *p);
+        else
+            fputc(*p, out);
+    }
+    fputc('"', out);
 }
 
 /*
@@ -399,27 +499,35 @@ static void build_status_text(int session_count, char *out, size_t out_size) {
  * We shell out to curl rather than pulling in libcurl as a dependency.
  * The token and body are passed via argv to exec, not interpolated into a shell string.
  */
-static int update_slack_status(const char *token, int session_count) {
-    char status_text[256];
-    build_status_text(session_count, status_text, sizeof(status_text));
+static int update_slack_status(const char *token, const process_config_t *config,
+                               const int *counts) {
+    char status_text[MAX_STATUS_TEXT];
+    build_status_text(config, counts, status_text, sizeof(status_text));
+    const char *emoji = status_text[0] ? ":computer:" : "";
+    for (int i = 0; i < config->count; i++) {
+        if (is_claude(config->names[i]) && counts[i] > 0) emoji = ":claude_code:";
+    }
 
-    char body[1024];
-    snprintf(body, sizeof(body),
-        "{\"profile\":{\"status_text\":\"%s\","
-        "\"status_emoji\":\":claude_code:\","
-        "\"status_expiration\":0}}",
-        status_text);
+    char *body = NULL;
+    size_t body_size = 0;
+    FILE *payload = open_memstream(&body, &body_size);
+    if (!payload) return -1;
+    fputs("{\"profile\":{\"status_text\":", payload);
+    write_json_string(payload, status_text);
+    fprintf(payload, ",\"status_emoji\":\"%s\",\"status_expiration\":0}}", emoji);
+    if (fclose(payload) != 0) {
+        free(body);
+        return -1;
+    }
 
     char auth_header[512];
     snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s", token);
 
-    /*
-     * Build curl argv directly — no shell interpretation, no injection risk.
-     * We use posix_spawn/exec via popen with a carefully constructed command.
-     */
+    /* Build curl argv directly and capture its response through a pipe. */
     int pipefd[2];
     if (pipe(pipefd) < 0) {
         perror("pipe");
+        free(body);
         return -1;
     }
 
@@ -428,6 +536,7 @@ static int update_slack_status(const char *token, int session_count) {
         perror("fork");
         close(pipefd[0]);
         close(pipefd[1]);
+        free(body);
         return -1;
     }
 
@@ -447,6 +556,8 @@ static int update_slack_status(const char *token, int session_count) {
                (char *)NULL);
         _exit(127);
     }
+
+    free(body);
 
     /* Parent: read response */
     close(pipefd[1]);
@@ -480,22 +591,19 @@ static int update_slack_status(const char *token, int session_count) {
 
 /* ── Detect + validate (combined) ────────────────────────────────── */
 
-static int detect_sessions(claude_session_t *sessions, int max) {
-    int candidate_count = find_claude_processes(sessions, max);
-
-    int validated = 0;
-    for (int i = 0; i < candidate_count; i++) {
-        if (validate_claude_binary(sessions[i].pid)) {
-            proc_pidpath(sessions[i].pid, sessions[i].exe_path,
-                         sizeof(sessions[i].exe_path));
-            if (i != validated)
-                sessions[validated] = sessions[i];
-            validated++;
+static int detect_sessions(process_session_t *sessions, int max,
+                           const process_config_t *config, int *counts) {
+    memset(counts, 0, sizeof(int) * MAX_PROCESSES);
+    int count = find_processes(sessions, max, config);
+    for (int i = 0; i < count; i++)
+        counts[sessions[i].process_index]++;
+    for (int i = 0; i < config->count; i++) {
+        if (is_claude(config->names[i]) && counts[i] > 0) {
+            enrich_from_session_files(sessions, count, config);
+            break;
         }
     }
-
-    enrich_from_session_files(sessions, validated);
-    return validated;
+    return count;
 }
 
 /* ── Output helpers ──────────────────────────────────────────────── */
@@ -508,14 +616,21 @@ static void print_timestamp(void) {
     printf("[%s] ", ts);
 }
 
-static void print_sessions(claude_session_t *sessions, int count) {
+static void print_sessions(process_session_t *sessions, int count,
+                           const process_config_t *config) {
     print_timestamp();
-    printf("Detected %d Claude Code session%s\n",
-           count, count == 1 ? "" : "s");
+    if (config->count == 1 && is_claude(config->names[0]))
+        printf("Detected %d Claude Code session%s\n", count, count == 1 ? "" : "s");
+    else {
+        printf("Detected %d process%s (", count, count == 1 ? "" : "es");
+        for (int i = 0; i < config->count; i++)
+            printf("%s%s", i ? ", " : "", config->names[i]);
+        printf(")\n");
+    }
 
     for (int i = 0; i < count; i++) {
-        claude_session_t *s = &sessions[i];
-        printf("  PID %-6d", s->pid);
+        process_session_t *s = &sessions[i];
+        printf("  PID %-6d | %s", s->pid, config->names[s->process_index]);
         if (s->tty[0]) printf(" | %s", s->tty);
         if (s->cwd[0]) printf(" | %s", s->cwd);
         if (s->session_id[0]) printf(" | session: %s", s->session_id);
@@ -529,18 +644,25 @@ static void print_sessions(claude_session_t *sessions, int count) {
     }
 }
 
-static void print_json(claude_session_t *sessions, int count) {
+static void print_json_field(const char *key, const char *value) {
+    printf(",\"%s\":", key);
+    write_json_string(stdout, value);
+}
+
+static void print_json(process_session_t *sessions, int count,
+                       const process_config_t *config) {
     printf("{\"count\":%d,\"sessions\":[", count);
     for (int i = 0; i < count; i++) {
-        claude_session_t *s = &sessions[i];
+        process_session_t *s = &sessions[i];
         if (i > 0) printf(",");
         printf("{\"pid\":%d", s->pid);
-        if (s->tty[0]) printf(",\"tty\":\"%s\"", s->tty);
-        if (s->cwd[0]) printf(",\"cwd\":\"%s\"", s->cwd);
-        if (s->exe_path[0]) printf(",\"exe\":\"%s\"", s->exe_path);
-        if (s->session_id[0]) printf(",\"sessionId\":\"%s\"", s->session_id);
+        print_json_field("process", config->names[s->process_index]);
+        if (s->tty[0]) print_json_field("tty", s->tty);
+        if (s->cwd[0]) print_json_field("cwd", s->cwd);
+        if (s->exe_path[0]) print_json_field("exe", s->exe_path);
+        if (s->session_id[0]) print_json_field("sessionId", s->session_id);
         if (s->started_at > 0) printf(",\"startedAt\":%ld", (long)s->started_at);
-        printf(",\"args\":\"%s\"", s->args);
+        print_json_field("args", s->args);
         printf("}");
     }
     printf("]}\n");
@@ -557,7 +679,55 @@ static void handle_signal(int sig) {
     g_running = 0;
 }
 
-static int install_service(void) {
+static void write_xml_string(FILE *out, const char *value) {
+    fputs("        <string>", out);
+    for (const unsigned char *p = (const unsigned char *)value; *p; p++) {
+        switch (*p) {
+            case '&': fputs("&amp;", out); break;
+            case '<': fputs("&lt;", out); break;
+            case '>': fputs("&gt;", out); break;
+            case '"': fputs("&quot;", out); break;
+            case '\'': fputs("&apos;", out); break;
+            default: fputc(*p, out); break;
+        }
+    }
+    fputs("</string>\n", out);
+}
+
+static int write_service_plist(FILE *out, const char *binary_path, const char *token,
+                               const process_config_t *config, int poll_interval,
+                               int json_output, int quiet) {
+    fputs("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+          "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\""
+          " \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+          "<plist version=\"1.0\">\n<dict>\n"
+          "    <key>Label</key>\n    <string>com.claudeiness.agent</string>\n"
+          "    <key>ProgramArguments</key>\n    <array>\n", out);
+    write_xml_string(out, binary_path);
+    write_xml_string(out, "--watch");
+    for (int i = 0; i < config->count; i++) {
+        write_xml_string(out, "--process");
+        write_xml_string(out, config->names[i]);
+    }
+    char interval[32];
+    snprintf(interval, sizeof(interval), "%d", poll_interval);
+    write_xml_string(out, "--interval");
+    write_xml_string(out, interval);
+    if (json_output) write_xml_string(out, "--json");
+    if (quiet) write_xml_string(out, "--quiet");
+    fputs("    </array>\n    <key>EnvironmentVariables</key>\n    <dict>\n"
+          "        <key>SLACK_TOKEN</key>\n", out);
+    write_xml_string(out, token);
+    fputs("    </dict>\n    <key>RunAtLoad</key>\n    <true/>\n"
+          "    <key>KeepAlive</key>\n    <true/>\n"
+          "    <key>StandardOutPath</key>\n    <string>/tmp/claudeiness.log</string>\n"
+          "    <key>StandardErrorPath</key>\n    <string>/tmp/claudeiness.error.log</string>\n"
+          "</dict>\n</plist>\n", out);
+    return !ferror(out);
+}
+
+static int install_service(const process_config_t *config, int poll_interval,
+                           int json_output, int quiet) {
     /* Resolve own binary path */
     char binary_path[PROC_PIDPATHINFO_MAXSIZE];
     if (proc_pidpath(getpid(), binary_path, sizeof(binary_path)) <= 0) {
@@ -585,52 +755,20 @@ static int install_service(void) {
                               ? token
                               : "YOUR_SLACK_TOKEN_HERE";
 
-    /* Generate plist XML */
-    char plist_content[4096];
-    int written = snprintf(plist_content, sizeof(plist_content),
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
-        "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\""
-        " \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
-        "<plist version=\"1.0\">\n"
-        "<dict>\n"
-        "    <key>Label</key>\n"
-        "    <string>com.claudeiness.agent</string>\n"
-        "    <key>ProgramArguments</key>\n"
-        "    <array>\n"
-        "        <string>%s</string>\n"
-        "        <string>--watch</string>\n"
-        "    </array>\n"
-        "    <key>EnvironmentVariables</key>\n"
-        "    <dict>\n"
-        "        <key>SLACK_TOKEN</key>\n"
-        "        <string>%s</string>\n"
-        "    </dict>\n"
-        "    <key>RunAtLoad</key>\n"
-        "    <true/>\n"
-        "    <key>KeepAlive</key>\n"
-        "    <true/>\n"
-        "    <key>StandardOutPath</key>\n"
-        "    <string>/tmp/claudeiness.log</string>\n"
-        "    <key>StandardErrorPath</key>\n"
-        "    <string>/tmp/claudeiness.error.log</string>\n"
-        "</dict>\n"
-        "</plist>\n",
-        binary_path, token_value);
-
-    if (written < 0 || (size_t)written >= sizeof(plist_content)) {
-        fprintf(stderr, "Error: plist content too large\n");
-        return EXIT_FAILURE;
-    }
-
-    /* Write plist file */
+    /* Write plist with the same process selection and watch options. */
     FILE *f = fopen(plist_path, "w");
     if (!f) {
         fprintf(stderr, "Error: cannot write plist to %s: %s\n",
                 plist_path, strerror(errno));
         return EXIT_FAILURE;
     }
-    fputs(plist_content, f);
-    fclose(f);
+    int wrote = write_service_plist(f, binary_path, token_value, config,
+                                    poll_interval, json_output, quiet);
+    int closed = fclose(f);
+    if (!wrote || closed != 0) {
+        fprintf(stderr, "Error: failed to write plist to %s\n", plist_path);
+        return EXIT_FAILURE;
+    }
 
     /* Load the service via launchctl (fork/exec to avoid shell injection) */
     pid_t pid = fork();
@@ -673,9 +811,19 @@ int main(int argc, char *argv[]) {
     int watch_mode = 0;
     int quiet = 0;
     int poll_interval = DEFAULT_POLL_SECONDS;
+    int install_service_mode = 0;
+    process_config_t config = {0};
 
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--json") == 0) {
+        if (strcmp(argv[i], "--process") == 0 || strcmp(argv[i], "-p") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Error: --process requires an executable name\n");
+                return EXIT_FAILURE;
+            }
+            if (!add_process(&config, argv[++i])) return EXIT_FAILURE;
+        } else if (strncmp(argv[i], "--process=", 10) == 0) {
+            if (!add_process(&config, argv[i] + 10)) return EXIT_FAILURE;
+        } else if (strcmp(argv[i], "--json") == 0) {
             json_output = 1;
         } else if (strcmp(argv[i], "--watch") == 0 || strcmp(argv[i], "-w") == 0) {
             watch_mode = 1;
@@ -685,44 +833,58 @@ int main(int argc, char *argv[]) {
         } else if (strcmp(argv[i], "--quiet") == 0 || strcmp(argv[i], "-q") == 0) {
             quiet = 1;
         } else if (strcmp(argv[i], "--install-service") == 0) {
-            return install_service();
+            install_service_mode = 1;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             fprintf(stderr,
-                "Usage: claudeiness [--json] [--watch [--interval N]]\n"
-                "       claudeiness --install-service\n\n"
-                "Detects running Claude Code sessions and updates Slack status.\n\n"
+                "Usage: claudeiness [--process NAME ...] [--json] [--watch [--interval N]]\n"
+                "       claudeiness --install-service [--process NAME ...] [--interval N]\n\n"
+                "Detects selected processes and updates Slack status (default: Claude Code).\n\n"
                 "Modes:\n"
                 "  (default)          One-shot: detect, print, update Slack, exit.\n"
                 "  --watch, -w        Watch: poll every N seconds (default %d),\n"
-                "                     update Slack only when session count changes.\n"
+                "                     update Slack when any selected process count changes.\n"
                 "  --install-service  Generate and install a launchd plist so watch\n"
                 "                     mode starts automatically at login.\n\n"
                 "Options:\n"
+                "  --process, -p NAME  Monitor this executable name (repeatable, max 16).\n"
+                "                     Replaces the default Claude selection; case-insensitive,\n"
+                "                     exact name matching (excludes app helper processes).\n"
                 "  --json          Output as JSON\n"
                 "  --quiet, -q     Suppress all output\n"
                 "  --interval N    Poll interval in seconds (default %d, min 1)\n\n"
+                "Examples:\n"
+                "  claudeiness --process Obsidian\n"
+                "  claudeiness --watch --process claude --process Obsidian\n\n"
                 "Environment:\n"
                 "  SLACK_TOKEN   Slack OAuth token (scope: users.profile:write)\n"
                 "                If not set, Slack update is skipped.\n"
                 "                Set before running --install-service to embed in plist.\n",
                 DEFAULT_POLL_SECONDS, DEFAULT_POLL_SECONDS);
             return EXIT_SUCCESS;
+        } else {
+            fprintf(stderr, "Error: unknown option or missing value: %s\n", argv[i]);
+            return EXIT_FAILURE;
         }
     }
+
+    if (config.count == 0) add_process(&config, "claude");
+    if (install_service_mode)
+        return install_service(&config, poll_interval, json_output, quiet);
 
     const char *token = getenv("SLACK_TOKEN");
     int has_token = token && token[0] != '\0';
 
     if (!watch_mode) {
         /* ── One-shot mode ──────────────────────────────────── */
-        claude_session_t sessions[MAX_SESSIONS];
-        int count = detect_sessions(sessions, MAX_SESSIONS);
+        process_session_t sessions[MAX_SESSIONS];
+        int counts[MAX_PROCESSES];
+        int count = detect_sessions(sessions, MAX_SESSIONS, &config, counts);
 
         if (!quiet) {
             if (json_output)
-                print_json(sessions, count);
+                print_json(sessions, count, &config);
             else
-                print_sessions(sessions, count);
+                print_sessions(sessions, count, &config);
         }
 
         if (!has_token) {
@@ -731,11 +893,11 @@ int main(int argc, char *argv[]) {
             return EXIT_SUCCESS;
         }
 
-        int result = update_slack_status(token, count);
+        int result = update_slack_status(token, &config, counts);
         if (result == 0) {
             if (!quiet && !json_output) {
-                char status_text[256];
-                build_status_text(count, status_text, sizeof(status_text));
+                char status_text[MAX_STATUS_TEXT];
+                build_status_text(&config, counts, status_text, sizeof(status_text));
                 printf("Slack status updated: %s\n",
                        count > 0 ? status_text : "(cleared)");
             }
@@ -755,33 +917,37 @@ int main(int argc, char *argv[]) {
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
 
-    if (!quiet) {
+    if (!quiet && !json_output) {
         print_timestamp();
-        printf("Watching for Claude Code sessions (polling every %ds)...\n",
-               poll_interval);
+        printf("Watching for ");
+        for (int i = 0; i < config.count; i++)
+            printf("%s%s", i ? ", " : "", config.names[i]);
+        printf(" (polling every %ds)...\n", poll_interval);
         fflush(stdout);
     }
 
-    int prev_count = -1;  /* -1 = no previous state, force initial update */
+    int prev_counts[MAX_PROCESSES] = {0};
+    int has_previous = 0;  /* Force the initial update. */
 
     while (g_running) {
-        claude_session_t sessions[MAX_SESSIONS];
-        int count = detect_sessions(sessions, MAX_SESSIONS);
+        process_session_t sessions[MAX_SESSIONS];
+        int counts[MAX_PROCESSES];
+        int count = detect_sessions(sessions, MAX_SESSIONS, &config, counts);
 
-        if (count != prev_count) {
+        if (!has_previous || memcmp(counts, prev_counts, sizeof(counts)) != 0) {
             if (!quiet) {
                 if (json_output)
-                    print_json(sessions, count);
+                    print_json(sessions, count, &config);
                 else
-                    print_sessions(sessions, count);
+                    print_sessions(sessions, count, &config);
             }
 
-            int result = update_slack_status(token, count);
+            int result = update_slack_status(token, &config, counts);
             if (!quiet) {
                 if (result == 0) {
                     if (!json_output) {
-                        char status_text[256];
-                        build_status_text(count, status_text, sizeof(status_text));
+                        char status_text[MAX_STATUS_TEXT];
+                        build_status_text(&config, counts, status_text, sizeof(status_text));
                         print_timestamp();
                         printf("Slack status → %s\n",
                                count > 0 ? status_text : "(cleared)");
@@ -789,24 +955,28 @@ int main(int argc, char *argv[]) {
                 } else {
                     if (!json_output) {
                         print_timestamp();
-                        printf("Slack update failed (will retry on next change)\n");
+                        printf("Slack update failed (will retry on next poll)\n");
                     }
                 }
                 fflush(stdout);
             }
 
-            prev_count = count;
+            if (result == 0) {
+                memcpy(prev_counts, counts, sizeof(counts));
+                has_previous = 1;
+            }
         }
 
         sleep((unsigned int)poll_interval);
     }
 
     /* Clean exit: clear Slack status */
-    if (!quiet) {
+    if (!quiet && !json_output) {
         print_timestamp();
         printf("Shutting down, clearing Slack status...\n");
     }
-    update_slack_status(token, 0);
+    int empty_counts[MAX_PROCESSES] = {0};
+    update_slack_status(token, &config, empty_counts);
 
     return EXIT_SUCCESS;
 }
