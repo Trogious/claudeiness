@@ -4,7 +4,7 @@ LDFLAGS = -lproc
 SRC = Sources/claudeiness.c
 BIN = claudeiness
 
-.PHONY: all clean install
+.PHONY: all clean install test
 
 all: $(BIN)
 
@@ -16,3 +16,6 @@ clean:
 
 install: $(BIN)
 	cp $(BIN) /usr/local/bin/$(BIN)
+
+test: $(BIN)
+	python3 Tests/test_cli.py
