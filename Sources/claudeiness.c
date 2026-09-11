@@ -1,26 +1,33 @@
 /*
  * claudeiness — Detect selected processes and update Slack status.
  *
- * Detection strategy (layered, cross-referenced):
+ * Detection strategy:
  *
- * 1. BSD process table scan via sysctl(KERN_PROC_UID)
- *    - Ground truth for what is actually running
- *    - Matches selected executable names (defaults to Claude Code)
- *    - Skips zombies
+ * 1. Claude Code: session registry scan of ~/.claude/sessions/<pid>.json
+ *    - Maintained by Claude Code itself: one file per running session,
+ *      created on start, removed on exit
+ *    - Only user-driven kinds ("interactive", "remote-control") count;
+ *      helper invocations (--chrome-native-host, mcp serve) never
+ *      register and headless "print"/"sdk" runs are excluded by kind
+ *    - Stale files (crash / kill -9 leftovers) are pruned: the pid must
+ *      be alive, not a zombie, running a Claude Code binary, and have
+ *      started at the time recorded in "procStart" (guards pid reuse)
  *
- * 2. Executable path validation via proc_pidpath()
- *    - Confirms the binary is the real Claude Code executable
- *    - Checks Mach-O magic bytes to reject scripts named "claude"
- *    - Falls back to trusting process name if path can't be read
+ * 2. BSD process table scan via sysctl(KERN_PROC_UID)
+ *    - Ground truth for non-Claude --process selections, and for claude
+ *      processes the registry does not know about (versions predating
+ *      the registry, or when the registry directory is absent)
+ *    - Matches selected executable names, validates Claude binaries via
+ *      proc_pidpath() + Mach-O magic bytes, skips zombies and known
+ *      helper invocations by argv
  *
- * 3. Session file enrichment from ~/.claude/sessions/ *.json
- *    - Adds sessionId, cwd, startedAt metadata
- *    - NOT used for counting — only enrichment
- *    - Stale files (dead PIDs) are naturally ignored
- *
- * 4. Slack status update via users.profile.set
+ * 3. Slack status update via users.profile.set
  *    - Token from SLACK_TOKEN environment variable
  *    - Skipped if token is not set
+ *
+ * Watch mode is event-driven when Claude Code is monitored: a kqueue
+ * vnode watch on the registry directory wakes the loop the moment a
+ * session starts or exits, with a periodic sweep for everything else.
  */
 
 #include <stdio.h>
@@ -41,6 +48,8 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <sys/wait.h>
+#include <sys/event.h>
+#include <signal.h>
 
 #define EXIT_COMMAND_NOT_FOUND 127
 
@@ -69,6 +78,9 @@ typedef struct {
     char  session_id[128];
     int   has_session_file;
     time_t started_at;    /* 0 = unknown */
+    char  kind[32];       /* registry "kind": interactive, remote-control, ... */
+    char  name[128];      /* registry display name */
+    char  status[32];     /* registry status: busy, idle, ... */
 } process_session_t;
 
 static int is_claude(const char *name) {
@@ -98,7 +110,7 @@ static int add_process(process_config_t *config, const char *name) {
     return 1;
 }
 
-/* ── Step 1: BSD process table scan ──────────────────────────────── */
+/* ── Process table scan ──────────────────────────────────────────── */
 
 /*
  * Check if a string looks like a semver version (e.g. "2.1.89").
@@ -134,6 +146,80 @@ static int match_process(const process_config_t *config, const char *comm,
             return i;  /* Claude-specific binary validation follows. */
     }
     return -1;
+}
+
+/*
+ * Fill tty, args and cwd for a session whose pid is already set.
+ * Best-effort: fields stay empty if the process vanishes mid-query
+ * (args then defaults to default_args).
+ */
+static void fill_proc_details(process_session_t *s, const char *default_args) {
+    /* TTY device → name, via per-pid kinfo */
+    {
+        int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, s->pid };
+        struct kinfo_proc kp;
+        size_t len = sizeof(kp);
+        if (sysctl(mib, 4, &kp, &len, NULL, 0) == 0 && len >= sizeof(kp)) {
+            dev_t tdev = kp.kp_eproc.e_tdev;
+            if (tdev != 0 && tdev != (dev_t)-1) {
+                char *dn = devname(tdev, S_IFCHR);
+                if (dn) snprintf(s->tty, sizeof(s->tty), "%s", dn);
+            }
+        }
+    }
+
+    /* Full command-line args via KERN_PROCARGS2 */
+    {
+        int args_mib[3] = { CTL_KERN, KERN_PROCARGS2, s->pid };
+        size_t args_size = 0;
+        if (sysctl(args_mib, 3, NULL, &args_size, NULL, 0) == 0 && args_size > 0) {
+            char *buf = malloc(args_size);
+            if (buf && sysctl(args_mib, 3, buf, &args_size, NULL, 0) == 0 &&
+                args_size >= sizeof(int)) {
+                /* Layout: [int argc][exec_path\0][padding\0s][argv0\0 argv1\0 ...] */
+                int argc;
+                memcpy(&argc, buf, sizeof(int));
+                size_t off = sizeof(int);
+
+                /* Skip exec path */
+                while (off < args_size && buf[off] != '\0') off++;
+                /* Skip null padding */
+                while (off < args_size && buf[off] == '\0') off++;
+
+                /* Collect argv */
+                size_t out_off = 0;
+                int arg_i = 0;
+                while (off < args_size && arg_i < argc) {
+                    size_t len = strnlen(&buf[off], args_size - off);
+                    if (len > 0) {
+                        if (out_off > 0 && out_off < MAX_ARGS - 1)
+                            s->args[out_off++] = ' ';
+                        size_t copy_len = len;
+                        if (out_off + copy_len >= MAX_ARGS - 1)
+                            copy_len = MAX_ARGS - 1 - out_off;
+                        memcpy(&s->args[out_off], &buf[off], copy_len);
+                        out_off += copy_len;
+                    }
+                    off += len + 1;
+                    arg_i++;
+                }
+                s->args[out_off] = '\0';
+            }
+            free(buf);
+        }
+        if (s->args[0] == '\0')
+            snprintf(s->args, sizeof(s->args), "%s", default_args);
+    }
+
+    /* Current working directory via proc_pidinfo */
+    {
+        struct proc_vnodepathinfo vpi;
+        int ret = proc_pidinfo(s->pid, PROC_PIDVNODEPATHINFO, 0,
+                               &vpi, sizeof(vpi));
+        if (ret == (int)sizeof(vpi) && vpi.pvi_cdir.vip_path[0] != '\0') {
+            snprintf(s->cwd, sizeof(s->cwd), "%s", vpi.pvi_cdir.vip_path);
+        }
+    }
 }
 
 /* Query the current user's live processes and collect selected executables. */
@@ -190,66 +276,7 @@ static int find_processes(process_session_t *out, int max,
         s->pid = p->kp_proc.p_pid;
         s->process_index = process_index;
         snprintf(s->exe_path, sizeof(s->exe_path), "%s", path);
-
-        /* TTY device → name */
-        dev_t tdev = p->kp_eproc.e_tdev;
-        if (tdev != 0 && tdev != (dev_t)-1) {
-            char *dn = devname(tdev, S_IFCHR);
-            if (dn) snprintf(s->tty, sizeof(s->tty), "%s", dn);
-        }
-
-        /* Full command-line args via KERN_PROCARGS2 */
-        {
-            int args_mib[3] = { CTL_KERN, KERN_PROCARGS2, s->pid };
-            size_t args_size = 0;
-            if (sysctl(args_mib, 3, NULL, &args_size, NULL, 0) == 0 && args_size > 0) {
-                char *buf = malloc(args_size);
-                if (buf && sysctl(args_mib, 3, buf, &args_size, NULL, 0) == 0 &&
-                    args_size >= sizeof(int)) {
-                    /* Layout: [int argc][exec_path\0][padding\0s][argv0\0 argv1\0 ...] */
-                    int argc;
-                    memcpy(&argc, buf, sizeof(int));
-                    size_t off = sizeof(int);
-
-                    /* Skip exec path */
-                    while (off < args_size && buf[off] != '\0') off++;
-                    /* Skip null padding */
-                    while (off < args_size && buf[off] == '\0') off++;
-
-                    /* Collect argv */
-                    size_t out_off = 0;
-                    int arg_i = 0;
-                    while (off < args_size && arg_i < argc) {
-                        size_t len = strnlen(&buf[off], args_size - off);
-                        if (len > 0) {
-                            if (out_off > 0 && out_off < MAX_ARGS - 1)
-                                s->args[out_off++] = ' ';
-                            size_t copy_len = len;
-                            if (out_off + copy_len >= MAX_ARGS - 1)
-                                copy_len = MAX_ARGS - 1 - out_off;
-                            memcpy(&s->args[out_off], &buf[off], copy_len);
-                            out_off += copy_len;
-                        }
-                        off += len + 1;
-                        arg_i++;
-                    }
-                    s->args[out_off] = '\0';
-                }
-                free(buf);
-            }
-            if (s->args[0] == '\0')
-                snprintf(s->args, sizeof(s->args), "%s", config->names[process_index]);
-        }
-
-        /* Current working directory via proc_pidinfo */
-        {
-            struct proc_vnodepathinfo vpi;
-            int ret = proc_pidinfo(s->pid, PROC_PIDVNODEPATHINFO, 0,
-                                   &vpi, sizeof(vpi));
-            if (ret == (int)sizeof(vpi) && vpi.pvi_cdir.vip_path[0] != '\0') {
-                snprintf(s->cwd, sizeof(s->cwd), "%s", vpi.pvi_cdir.vip_path);
-            }
-        }
+        fill_proc_details(s, config->names[process_index]);
 
         found++;
     }
@@ -258,7 +285,7 @@ static int find_processes(process_session_t *out, int max,
     return found;
 }
 
-/* ── Step 2: Executable path validation ──────────────────────────── */
+/* ── Executable path validation ──────────────────────────────────── */
 
 /*
  * Check if a file starts with a Mach-O magic number.
@@ -335,7 +362,25 @@ static int validate_claude_binary(pid_t pid) {
     return 0;
 }
 
-/* ── Step 3: Session file enrichment ─────────────────────────────── */
+/* ── Session registry: ~/.claude/sessions/<pid>.json ─────────────── */
+
+/*
+ * Path of Claude Code's session registry directory.
+ * $HOME is preferred over getpwuid so launchd EnvironmentVariables and
+ * tests can redirect it; out is "" if no home can be determined.
+ */
+static void registry_dir_path(char *out, size_t out_size) {
+    const char *home = getenv("HOME");
+    if (!home || home[0] == '\0') {
+        struct passwd *pw = getpwuid(getuid());
+        home = pw ? pw->pw_dir : NULL;
+    }
+    if (!home) {
+        out[0] = '\0';
+        return;
+    }
+    snprintf(out, out_size, "%s/.claude/sessions", home);
+}
 
 /*
  * Minimal JSON string value extractor.
@@ -387,11 +432,9 @@ static int json_get_number(const char *json, const char *key, long long *out) {
  */
 static void enrich_from_session_files(process_session_t *sessions, int count,
                                        const process_config_t *config) {
-    struct passwd *pw = getpwuid(getuid());
-    if (!pw) return;
-
     char dir_path[MAX_PATH];
-    snprintf(dir_path, sizeof(dir_path), "%s/.claude/sessions", pw->pw_dir);
+    registry_dir_path(dir_path, sizeof(dir_path));
+    if (dir_path[0] == '\0') return;
 
     DIR *dir = opendir(dir_path);
     if (!dir) return;
@@ -440,7 +483,152 @@ static void enrich_from_session_files(process_session_t *sessions, int count,
     closedir(dir);
 }
 
-/* ── Step 4: Slack status update ─────────────────────────────────── */
+/*
+ * Parse the registry's "procStart" value — the kernel process start time
+ * rendered as ctime in UTC, e.g. "Fri Sep 11 13:47:09 2026".
+ * Returns 0 if missing or unparseable.
+ */
+static time_t parse_proc_start_utc(const char *s) {
+    if (!s || !*s) return 0;
+    struct tm tm;
+    memset(&tm, 0, sizeof(tm));
+    if (!strptime(s, "%a %b %e %H:%M:%S %Y", &tm)) return 0;
+    time_t t = timegm(&tm);
+    return t > 0 ? t : 0;
+}
+
+/*
+ * A registry file survives a crash / kill -9, so a listed pid may be dead
+ * or even reused by an unrelated process. Accept a pid only if it exists,
+ * is not a zombie, runs a Claude Code binary, and — when the registry
+ * recorded procStart — started at the recorded time.
+ */
+static int registry_entry_alive(pid_t pid, const char *proc_start_utc) {
+    int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, pid };
+    struct kinfo_proc kp;
+    size_t len = sizeof(kp);
+    if (sysctl(mib, 4, &kp, &len, NULL, 0) != 0 || len < sizeof(kp) ||
+        kp.kp_proc.p_pid != pid)
+        return 0;
+    if (kp.kp_proc.p_stat == SZOMB)
+        return 0;
+    if (!validate_claude_binary(pid))
+        return 0;
+
+    time_t recorded = parse_proc_start_utc(proc_start_utc);
+    if (recorded > 0) {
+        long long delta = (long long)kp.kp_proc.p_starttime.tv_sec
+                        - (long long)recorded;
+        /* ±2s tolerance: ctime truncates to whole seconds */
+        if (delta < -2 || delta > 2)
+            return 0;
+    }
+    return 1;
+}
+
+/*
+ * Primary detection for Claude Code: scan the session registry.
+ * Sessions with a user-driven kind become entries in out (with
+ * process_index = claude_index). Every alive registry pid — any kind —
+ * is recorded in known[], so the process scan can defer to the
+ * registry's verdict on those pids.
+ *
+ * Returns -1 if the registry directory cannot be opened (Claude Code
+ * versions predating the registry), otherwise the session count.
+ */
+static int detect_claude_registry(process_session_t *out, int max, int claude_index,
+                                  pid_t *known, int known_cap, int *known_count) {
+    *known_count = 0;
+
+    char dir_path[MAX_PATH];
+    registry_dir_path(dir_path, sizeof(dir_path));
+    if (dir_path[0] == '\0') return -1;
+
+    DIR *dir = opendir(dir_path);
+    if (!dir) return -1;
+
+    int found = 0;
+    struct dirent *ent;
+    while ((ent = readdir(dir)) != NULL && found < max) {
+        size_t namelen = strlen(ent->d_name);
+        if (namelen < 6 || strcmp(&ent->d_name[namelen - 5], ".json") != 0)
+            continue;
+
+        char filepath[MAX_PATH];
+        snprintf(filepath, sizeof(filepath), "%s/%s", dir_path, ent->d_name);
+
+        FILE *f = fopen(filepath, "r");
+        if (!f) continue;
+
+        char buf[4096];
+        size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+        fclose(f);
+        buf[n] = '\0';
+
+        long long file_pid;
+        if (!json_get_number(buf, "pid", &file_pid))
+            continue;
+
+        char proc_start[64] = "";
+        json_get_string(buf, "procStart", proc_start, sizeof(proc_start));
+        if (!registry_entry_alive((pid_t)file_pid, proc_start))
+            continue;
+
+        if (*known_count < known_cap)
+            known[(*known_count)++] = (pid_t)file_pid;
+
+        /*
+         * Count only user-driven sessions. Other kinds ("print", "sdk",
+         * "background", ...) are programmatic runs; a missing kind
+         * (older registry schema) is accepted.
+         */
+        char kind[32] = "";
+        json_get_string(buf, "kind", kind, sizeof(kind));
+        if (kind[0] != '\0' &&
+            strcmp(kind, "interactive") != 0 &&
+            strcmp(kind, "remote-control") != 0)
+            continue;
+
+        process_session_t *s = &out[found];
+        memset(s, 0, sizeof(*s));
+        s->pid = (pid_t)file_pid;
+        s->process_index = claude_index;
+        s->has_session_file = 1;
+        snprintf(s->kind, sizeof(s->kind), "%s", kind);
+        json_get_string(buf, "sessionId", s->session_id, sizeof(s->session_id));
+        json_get_string(buf, "name", s->name, sizeof(s->name));
+        json_get_string(buf, "status", s->status, sizeof(s->status));
+        long long ts;
+        if (json_get_number(buf, "startedAt", &ts))
+            s->started_at = (time_t)(ts / 1000);
+
+        proc_pidpath(s->pid, s->exe_path, sizeof(s->exe_path));
+        fill_proc_details(s, "claude");
+        if (s->cwd[0] == '\0')
+            json_get_string(buf, "cwd", s->cwd, sizeof(s->cwd));
+
+        found++;
+    }
+    closedir(dir);
+    return found;
+}
+
+/*
+ * Non-session invocations of the claude binary that the process scan
+ * must not count: the Chrome extension's native-messaging host and
+ * "claude mcp serve" (Claude Code acting as an MCP stdio server).
+ */
+static int is_helper_invocation(const char *args) {
+    if (strstr(args, "--chrome-native-host") != NULL)
+        return 1;
+    const char *sp = strchr(args, ' ');
+    if (sp && strncmp(sp + 1, "mcp serve", 9) == 0 &&
+        (sp[10] == '\0' || sp[10] == ' '))
+        return 1;
+    return 0;
+}
+
+/* ── Slack status update ─────────────────────────────────────────── */
 
 #define MAX_STATUS_EMOJIS 7
 
@@ -589,21 +777,72 @@ static int update_slack_status(const char *token, const process_config_t *config
     return -1;
 }
 
-/* ── Detect + validate (combined) ────────────────────────────────── */
+/* ── Detect: registry first for Claude, process scan for the rest ── */
+
+static const char *g_claude_source = "none";
 
 static int detect_sessions(process_session_t *sessions, int max,
                            const process_config_t *config, int *counts) {
     memset(counts, 0, sizeof(int) * MAX_PROCESSES);
-    int count = find_processes(sessions, max, config);
-    for (int i = 0; i < count; i++)
+
+    int claude_index = -1;
+    for (int i = 0; i < config->count; i++)
+        if (is_claude(config->names[i])) claude_index = i;
+
+    /* Claude Code sessions: the registry's verdict wins for pids it lists */
+    int total = 0;
+    pid_t registry_pids[MAX_SESSIONS];
+    int registry_pid_count = 0;
+
+    if (claude_index >= 0) {
+        int from_registry = detect_claude_registry(sessions, max, claude_index,
+                                                   registry_pids, MAX_SESSIONS,
+                                                   &registry_pid_count);
+        if (from_registry >= 0) {
+            total = from_registry;
+            g_claude_source = "registry";
+        } else {
+            g_claude_source = "process-scan";
+        }
+    }
+
+    /*
+     * Process scan: all non-Claude selections, plus claude processes the
+     * registry does not know about (versions predating the registry, or
+     * the registry directory being absent entirely).
+     */
+    int scanned = find_processes(sessions + total, max - total, config);
+    int kept = total;
+    for (int i = total; i < total + scanned; i++) {
+        if (claude_index >= 0 && sessions[i].process_index == claude_index) {
+            if (is_helper_invocation(sessions[i].args))
+                continue;
+            int known = 0;
+            for (int k = 0; k < registry_pid_count; k++) {
+                if (registry_pids[k] == sessions[i].pid) {
+                    known = 1;
+                    break;
+                }
+            }
+            if (known)
+                continue;
+        }
+        if (i != kept)
+            sessions[kept] = sessions[i];
+        kept++;
+    }
+    total = kept;
+
+    for (int i = 0; i < total; i++)
         counts[sessions[i].process_index]++;
+
     for (int i = 0; i < config->count; i++) {
         if (is_claude(config->names[i]) && counts[i] > 0) {
-            enrich_from_session_files(sessions, count, config);
+            enrich_from_session_files(sessions, total, config);
             break;
         }
     }
-    return count;
+    return total;
 }
 
 /* ── Output helpers ──────────────────────────────────────────────── */
@@ -620,7 +859,8 @@ static void print_sessions(process_session_t *sessions, int count,
                            const process_config_t *config) {
     print_timestamp();
     if (config->count == 1 && is_claude(config->names[0]))
-        printf("Detected %d Claude Code session%s\n", count, count == 1 ? "" : "s");
+        printf("Detected %d Claude Code session%s (%s)\n",
+               count, count == 1 ? "" : "s", g_claude_source);
     else {
         printf("Detected %d process%s (", count, count == 1 ? "" : "es");
         for (int i = 0; i < config->count; i++)
@@ -632,6 +872,8 @@ static void print_sessions(process_session_t *sessions, int count,
         process_session_t *s = &sessions[i];
         printf("  PID %-6d | %s", s->pid, config->names[s->process_index]);
         if (s->tty[0]) printf(" | %s", s->tty);
+        if (s->name[0]) printf(" | %s", s->name);
+        if (s->status[0]) printf(" | %s", s->status);
         if (s->cwd[0]) printf(" | %s", s->cwd);
         if (s->session_id[0]) printf(" | session: %s", s->session_id);
         if (s->started_at > 0) {
@@ -651,13 +893,23 @@ static void print_json_field(const char *key, const char *value) {
 
 static void print_json(process_session_t *sessions, int count,
                        const process_config_t *config) {
-    printf("{\"count\":%d,\"sessions\":[", count);
+    int claude_configured = 0;
+    for (int i = 0; i < config->count; i++)
+        if (is_claude(config->names[i])) claude_configured = 1;
+
+    printf("{\"count\":%d", count);
+    if (claude_configured)
+        printf(",\"claudeSource\":\"%s\"", g_claude_source);
+    printf(",\"sessions\":[");
     for (int i = 0; i < count; i++) {
         process_session_t *s = &sessions[i];
         if (i > 0) printf(",");
         printf("{\"pid\":%d", s->pid);
         print_json_field("process", config->names[s->process_index]);
         if (s->tty[0]) print_json_field("tty", s->tty);
+        if (s->kind[0]) print_json_field("kind", s->kind);
+        if (s->name[0]) print_json_field("name", s->name);
+        if (s->status[0]) print_json_field("status", s->status);
         if (s->cwd[0]) print_json_field("cwd", s->cwd);
         if (s->exe_path[0]) print_json_field("exe", s->exe_path);
         if (s->session_id[0]) print_json_field("sessionId", s->session_id);
@@ -666,6 +918,72 @@ static void print_json(process_session_t *sessions, int count,
         printf("}");
     }
     printf("]}\n");
+}
+
+/* ── Watch mode: event-driven wait ───────────────────────────────── */
+
+/*
+ * The registry directory's entries mirror running Claude sessions, so a
+ * kqueue vnode watch on it wakes the watch loop the moment one starts or
+ * exits — no polling. Sessions killed with SIGKILL leave their file (and
+ * no event) behind, and non-Claude processes produce no events at all,
+ * so callers still recount on a periodic sweep.
+ */
+
+/*
+ * (Re)attach the vnode watch on the session registry directory.
+ * Returns the watched fd, or -1 if the directory is missing (older
+ * Claude Code) or registration failed — callers fall back to sleeping.
+ */
+static int ensure_registry_watch(int kq, int current_fd) {
+    if (current_fd >= 0) return current_fd;
+
+    char dir_path[MAX_PATH];
+    registry_dir_path(dir_path, sizeof(dir_path));
+    if (dir_path[0] == '\0') return -1;
+
+    int fd = open(dir_path, O_EVTONLY);
+    if (fd < 0) return -1;
+
+    struct kevent kev;
+    EV_SET(&kev, fd, EVFILT_VNODE, EV_ADD | EV_CLEAR,
+           NOTE_WRITE | NOTE_DELETE | NOTE_RENAME | NOTE_REVOKE, 0, NULL);
+    if (kevent(kq, &kev, 1, NULL, 0, NULL) < 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+/*
+ * Block until the session registry changes or sweep_seconds elapses.
+ * Interrupted immediately by SIGINT/SIGTERM (handlers install without
+ * SA_RESTART). Falls back to sleep() when no watch can be established.
+ */
+static void wait_for_change(int kq, int *registry_fd, int sweep_seconds) {
+    if (kq >= 0)
+        *registry_fd = ensure_registry_watch(kq, *registry_fd);
+
+    if (kq < 0 || *registry_fd < 0) {
+        sleep((unsigned int)sweep_seconds);
+        return;
+    }
+
+    struct timespec ts = { sweep_seconds, 0 };
+    struct kevent ev;
+    int n = kevent(kq, NULL, 0, &ev, 1, &ts);
+
+    /* Coalesce event bursts (create + write + rename) into one recount */
+    struct timespec zero = { 0, 0 };
+    while (n > 0) {
+        if (ev.fflags & (NOTE_DELETE | NOTE_RENAME | NOTE_REVOKE)) {
+            /* Directory itself replaced — re-attach on the next round */
+            close(*registry_fd);
+            *registry_fd = -1;
+            break;
+        }
+        n = kevent(kq, NULL, 0, &ev, 1, &zero);
+    }
 }
 
 /* ── Main ────────────────────────────────────────────────────────── */
@@ -838,11 +1156,16 @@ int main(int argc, char *argv[]) {
             fprintf(stderr,
                 "Usage: claudeiness [--process NAME ...] [--json] [--watch [--interval N]]\n"
                 "       claudeiness --install-service [--process NAME ...] [--interval N]\n\n"
-                "Detects selected processes and updates Slack status (default: Claude Code).\n\n"
+                "Detects selected processes and updates Slack status (default: Claude Code).\n"
+                "Claude Code sessions are read from its session registry\n"
+                "(~/.claude/sessions/<pid>.json), which excludes helper processes and\n"
+                "headless runs; a process-table scan covers everything else.\n\n"
                 "Modes:\n"
                 "  (default)          One-shot: detect, print, update Slack, exit.\n"
-                "  --watch, -w        Watch: poll every N seconds (default %d),\n"
-                "                     update Slack when any selected process count changes.\n"
+                "  --watch, -w        Watch: react instantly to session registry changes\n"
+                "                     via kqueue and recount at least every N seconds\n"
+                "                     (default %d); updates Slack when any selected\n"
+                "                     process count changes.\n"
                 "  --install-service  Generate and install a launchd plist so watch\n"
                 "                     mode starts automatically at login.\n\n"
                 "Options:\n"
@@ -851,7 +1174,7 @@ int main(int argc, char *argv[]) {
                 "                     exact name matching (excludes app helper processes).\n"
                 "  --json          Output as JSON\n"
                 "  --quiet, -q     Suppress all output\n"
-                "  --interval N    Poll interval in seconds (default %d, min 1)\n\n"
+                "  --interval N    Sweep/poll interval in seconds (default %d, min 1)\n\n"
                 "Examples:\n"
                 "  claudeiness --process Obsidian\n"
                 "  claudeiness --watch --process claude --process Obsidian\n\n"
@@ -914,15 +1237,32 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
-    signal(SIGINT, handle_signal);
-    signal(SIGTERM, handle_signal);
+    /* No SA_RESTART: SIGINT/SIGTERM must interrupt kevent()/sleep() so
+       shutdown (and the final Slack status clear) happens promptly. */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = handle_signal;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+
+    int claude_configured = 0;
+    for (int i = 0; i < config.count; i++)
+        if (is_claude(config.names[i])) claude_configured = 1;
+
+    /* Registry events only exist for Claude Code sessions. */
+    int kq = claude_configured ? kqueue() : -1;
+    int registry_fd = -1;
 
     if (!quiet && !json_output) {
         print_timestamp();
         printf("Watching for ");
         for (int i = 0; i < config.count; i++)
             printf("%s%s", i ? ", " : "", config.names[i]);
-        printf(" (polling every %ds)...\n", poll_interval);
+        if (kq >= 0)
+            printf(" (event-driven, sweep every %ds)...\n", poll_interval);
+        else
+            printf(" (polling every %ds)...\n", poll_interval);
         fflush(stdout);
     }
 
@@ -967,8 +1307,11 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        sleep((unsigned int)poll_interval);
+        wait_for_change(kq, &registry_fd, poll_interval);
     }
+
+    if (registry_fd >= 0) close(registry_fd);
+    if (kq >= 0) close(kq);
 
     /* Clean exit: clear Slack status */
     if (!quiet && !json_output) {
